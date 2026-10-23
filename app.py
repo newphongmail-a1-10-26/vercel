@@ -507,6 +507,10 @@ def _graceful_shutdown(signum, frame):
         logging.info(f"⚠️ Shutdown signal ({signum}) পাওয়া গেছে — pending MySQL write flush করা হচ্ছে...")
         print(f"⚠️ Shutdown signal ({signum}) — flushing pending MySQL writes before exit...")
         _EXECUTOR.shutdown(wait=True, cancel_futures=False)
+        try:
+            stock_sync_flush_all()   # 💾 লোকাল স্টক ফাইল MySQL এ শেষবার সেভ
+        except Exception as _sf_e:
+            logging.error(f"stock flush on shutdown failed: {_sf_e}")
         print("✅ সব pending MySQL write সম্পন্ন — নিরাপদে বন্ধ হচ্ছে।")
     except Exception as e:
         logging.error(f"_graceful_shutdown error: {e}")
@@ -5918,6 +5922,247 @@ LOG_FILE  = "bot_logs.txt"
 if not os.path.exists(STOCK_DIR):
     os.makedirs(STOCK_DIR)
 
+# ═══════════════════════════════════════════════════════════
+# 💾 LOCAL STOCK → MySQL PERSISTENCE
+# ═══════════════════════════════════════════════════════════
+# সমস্যা: লোকাল স্টক stocks/*.xlsx ডিস্কে থাকে। Railway/Render/Docker এ
+# redeploy বা restart হলে ডিস্ক মুছে যায় → লোকাল স্টক হারিয়ে যেত।
+#
+# সমাধান: stocks/ ফোল্ডার এখনও "working copy" হিসেবে থাকে (বাকি সব কোড
+# আগের মতোই কাজ করে), কিন্তু প্রতিটা .xlsx ফাইল MySQL এর bot_stock_files
+# টেবিলে অটো-সেভ হয়:
+#   • Startup এ MySQL থেকে সব স্টক ফাইল stocks/ এ ফিরিয়ে আনা হয়
+#   • ফাইল বদলালে (upload / বিক্রি / restore / rename / delete) ~২ সেকেন্ডের
+#     মধ্যে MySQL এ আপডেট হয় (invalidate_stock_cache() কল হলেই সাথে সাথে)
+#   • Shutdown (SIGTERM) এ শেষবার flush হয়
+#   • আগে থেকে ডিস্কে থাকা পুরনো স্টক ফাইল প্রথমবার চালালেই MySQL এ উঠে যায়
+import zipfile as _zipfile_stock
+import hashlib as _hashlib_stock
+
+_STOCK_SYNC_INTERVAL = 2.0
+_stock_sync_wake     = threading.Event()
+_stock_sync_pass_lock = threading.Lock()
+_stock_sync_known    = {}   # {file_name: sha256 — MySQL এ যেটা আছে}
+_stock_sync_sig      = {}   # {file_name: (mtime_ns, size) — শেষবার যেটা দেখা হয়েছে}
+_stock_sync_missing  = {}   # {file_name: পরপর কতবার ডিস্কে পাওয়া যায়নি}
+_stock_sync_ready    = False
+_stock_sync_thread   = None
+
+
+def _stock_sync_kick():
+    """Stock ফাইল বদলেছে — sync worker কে এখনই জাগাও।"""
+    _stock_sync_wake.set()
+
+
+def _stock_sync_init_table():
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_stock_files (
+                file_name  VARCHAR(191) PRIMARY KEY,
+                file_data  LONGBLOB NOT NULL,
+                file_hash  CHAR(64)  NOT NULL,
+                file_mtime BIGINT    NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+
+def _stock_sync_list_disk():
+    try:
+        names = os.listdir(STOCK_DIR)
+    except Exception:
+        return []
+    return [n for n in names
+            if n.lower().endswith(".xlsx") and not n.startswith("~$")
+            and os.path.isfile(os.path.join(STOCK_DIR, n))]
+
+
+def _stock_sync_push(fname):
+    """একটা stock ফাইল MySQL এ আপলোড (শুধু বদলালে)। True = সফল/অপরিবর্তিত।"""
+    path = os.path.join(STOCK_DIR, fname)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return True
+    sig = (st.st_mtime_ns, st.st_size)
+    if _stock_sync_sig.get(fname) == sig and fname in _stock_sync_known:
+        return True
+
+    lock = get_stock_lock(fname[:-5])
+    got = lock.acquire(timeout=5)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        st = os.stat(path)
+    except FileNotFoundError:
+        return True
+    finally:
+        if got:
+            lock.release()
+
+    sig = (st.st_mtime_ns, st.st_size)
+    # আধা-লেখা ফাইল আপলোড করা যাবে না — ZIP ঠিক আছে কিনা যাচাই
+    try:
+        import io as _io_ss
+        if not _zipfile_stock.is_zipfile(_io_ss.BytesIO(data)):
+            return False
+        with _zipfile_stock.ZipFile(_io_ss.BytesIO(data)) as _z:
+            if _z.testzip() is not None:
+                return False
+    except Exception:
+        return False
+
+    h = _hashlib_stock.sha256(data).hexdigest()
+    if _stock_sync_known.get(fname) == h:
+        _stock_sync_sig[fname] = sig
+        return True
+
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO bot_stock_files (file_name, file_data, file_hash, file_mtime) "
+            "VALUES (%s,%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE file_data=VALUES(file_data), "
+            "file_hash=VALUES(file_hash), file_mtime=VALUES(file_mtime)",
+            (fname, data, h, int(st.st_mtime))
+        )
+    _stock_sync_known[fname] = h
+    _stock_sync_sig[fname] = sig
+    return True
+
+
+def _stock_sync_delete(fname):
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM bot_stock_files WHERE file_name=%s", (fname,))
+    _stock_sync_known.pop(fname, None)
+    _stock_sync_sig.pop(fname, None)
+    _stock_sync_missing.pop(fname, None)
+
+
+def _stock_sync_pass():
+    """ডিস্ক ↔ MySQL এক দফা sync (নতুন/বদলানো ফাইল আপলোড, মোছা ফাইল ডিলিট)।"""
+    if not _stock_sync_ready:
+        return
+    with _stock_sync_pass_lock:
+        on_disk = set(_stock_sync_list_disk())
+        for fname in sorted(on_disk):
+            _stock_sync_missing.pop(fname, None)
+            try:
+                _stock_sync_push(fname)
+            except Exception as e:
+                logging.error(f"Stock sync push error [{fname}]: {e}")
+        # ডিস্ক থেকে মুছে গেছে (product delete / rename) → MySQL থেকেও মোছো
+        # (পরপর ২ বার না পেলে তবেই — rename/replace এর মাঝের মুহূর্ত এড়াতে)
+        for fname in list(_stock_sync_known.keys()):
+            if fname in on_disk:
+                continue
+            _stock_sync_missing[fname] = _stock_sync_missing.get(fname, 0) + 1
+            if _stock_sync_missing[fname] >= 2:
+                try:
+                    _stock_delete_ok = True
+                    _stock_sync_delete(fname)
+                except Exception as e:
+                    logging.error(f"Stock sync delete error [{fname}]: {e}")
+
+
+def stock_sync_restore_from_mysql():
+    """Startup: MySQL এ থাকা সব স্টক ফাইল stocks/ এ ফিরিয়ে আনো।
+    ডিস্কে একই ফাইল থাকলে যেটার mtime নতুন সেটা জেতে (crash এর আগের শেষ
+    পরিবর্তন যেন হারিয়ে না যায়)। সফল হলে True।"""
+    global _stock_sync_ready
+    os.makedirs(STOCK_DIR, exist_ok=True)
+    _stock_sync_init_table()
+    conn = _get_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT file_name, file_hash, file_mtime FROM bot_stock_files")
+        rows = cur.fetchall()
+
+    restored = 0
+    for fname, fhash, fmtime in rows:
+        path = os.path.join(STOCK_DIR, fname)
+        use_db = True
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    disk_hash = _hashlib_stock.sha256(f.read()).hexdigest()
+                if disk_hash == fhash:
+                    use_db = False
+                    _stock_sync_known[fname] = fhash
+                elif int(os.path.getmtime(path)) > int(fmtime) + 1:
+                    # ডিস্কের ফাইল নতুন → ওটাই রাখো, প্রথম pass এ MySQL এ উঠবে
+                    use_db = False
+                    _stock_sync_known[fname] = fhash
+            except Exception:
+                pass
+        if not use_db:
+            continue
+        with conn.cursor() as cur:
+            cur.execute("SELECT file_data FROM bot_stock_files WHERE file_name=%s", (fname,))
+            r = cur.fetchone()
+        if not r:
+            continue
+        data = bytes(r[0])
+        tmp = path + ".restore.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        try:
+            os.utime(path, (int(fmtime), int(fmtime)))
+        except Exception:
+            pass
+        _stock_sync_known[fname] = fhash
+        restored += 1
+
+    _stock_sync_ready = True
+    print(f"✅ Local stock restore: MySQL এ {len(rows)}টা ফাইল | ডিস্কে ফিরিয়ে আনা হয়েছে: {restored}টা")
+    return True
+
+
+def stock_sync_flush_all():
+    """Shutdown/redeploy এর আগে সব pending stock পরিবর্তন MySQL এ লিখে দাও।"""
+    try:
+        _stock_sync_pass()
+    except Exception as e:
+        logging.error(f"stock_sync_flush_all error: {e}")
+
+
+def _stock_sync_worker():
+    import time as _t_ss
+    while True:
+        try:
+            if not _stock_sync_ready:
+                try:
+                    stock_sync_restore_from_mysql()
+                except Exception as e:
+                    logging.error(f"Stock restore retry failed: {e}")
+                    _t_ss.sleep(10)
+                    continue
+            _stock_sync_pass()
+        except Exception as e:
+            logging.error(f"Stock sync worker error: {e}")
+        _stock_sync_wake.wait(_STOCK_SYNC_INTERVAL)
+        _stock_sync_wake.clear()
+
+
+def stock_sync_start():
+    """Bot চালুর সময় একবার কল হয় — আগে restore, তারপর background sync চালু।"""
+    global _stock_sync_thread
+    for attempt in range(3):
+        try:
+            stock_sync_restore_from_mysql()
+            break
+        except Exception as e:
+            logging.error(f"Stock restore attempt {attempt+1} failed: {e}")
+            print(f"⚠️ Local stock restore ব্যর্থ ({attempt+1}/3): {e}")
+            import time as _t_ss2
+            _t_ss2.sleep(2)
+    _stock_sync_thread = threading.Thread(target=_stock_sync_worker, daemon=True, name="stock_sync")
+    _stock_sync_thread.start()
+    print("✅ Local stock → MySQL auto-sync worker started")
+
+
 # ===========================
 # REAL TIME HELPER (UTC+6 Bangladesh / International)
 # ===========================
@@ -10714,6 +10959,10 @@ def get_stock_count(product_name):
 def invalidate_stock_cache(product_name):
     """Stock write হলে cache clear করো। Sub-product গুলোও clear হবে।"""
     _stock_count_cache.pop(product_name, None)
+    try:
+        _stock_sync_kick()   # 💾 লোকাল স্টক বদলেছে → MySQL এ সেভ করো
+    except Exception:
+        pass
     prefix = product_name + "__"
     for k in [k for k in list(_stock_count_cache.keys()) if k.startswith(prefix)]:
         _stock_count_cache.pop(k, None)
@@ -34141,6 +34390,9 @@ if __name__ == "__main__":
     print(f"📦 Stock Cache TTL: {_STOCK_CACHE_TTL}s")
     print(f"⚡ Callback ACK: INSTANT (pre-answer + thread pool)")
     print("=" * 60)
+
+    # 💾 লোকাল স্টক MySQL থেকে restore + auto-sync চালু (সবার আগে)
+    stock_sync_start()
 
     # Edu Mail/Hotmail/Outlook price auto-init
     auto_init_sub_products()
